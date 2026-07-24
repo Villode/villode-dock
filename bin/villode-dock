@@ -709,16 +709,48 @@ def toggle_daemon():
         return _start_daemon()
 
 
+def hypr_dispatch(*args, timeout=3):
+    """Run a hyprctl dispatcher (not via exec)."""
+    if not args:
+        return False
+    try:
+        result = subprocess.run(
+            ["hyprctl", "dispatch", *[str(a) for a in args]],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def spawn_command(command):
     """Launch on the currently focused Hyprland workspace.
 
     Dock is a long-lived daemon. Direct Popen inherits the daemon's initial
     workspace for Hyprland's initial_workspace_tracking, so apps opened from an
-    empty workspace can land on workspace 1. Prefer hyprctl dispatch exec.
+    empty workspace can land on workspace 1. Always use hyprctl dispatch exec.
     """
     if not command:
         return False
     argv = [str(part) for part in command]
+    # Never wrap hyprctl itself in dispatch exec (breaks focuswindow etc.)
+    if argv and Path(argv[0]).name == "hyprctl":
+        try:
+            result = subprocess.run(
+                argv,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     try:
         result = subprocess.run(
             ["hyprctl", "dispatch", "exec", "--", *argv],
@@ -732,18 +764,19 @@ def spawn_command(command):
             return True
     except (OSError, subprocess.TimeoutExpired):
         pass
+    # Last resort: still try hyprctl so we do not inherit daemon workspace 1
     try:
-        subprocess.Popen(
-            argv,
+        result = subprocess.run(
+            ["hyprctl", "dispatch", "exec", *argv],
+            check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+            timeout=3,
         )
-    except OSError:
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    return True
 
 
 def hypr_json(command, timeout=0.7):
@@ -2895,16 +2928,46 @@ def run_dock():
             return False
 
         def matching_client(self, item):
-            for client in self.clients:
-                if self.item_matches_client(item, client):
-                    return client
-            return None
+            matches = [
+                client
+                for client in (self.clients or [])
+                if self.item_matches_client(item, client)
+            ]
+            if not matches:
+                return None
+            # Prefer a window on the *current* workspace so focus does not jump
+            # to the first matching client on workspace 1.
+            active = hypr_json("activeworkspace") or {}
+            ws_id = active.get("id")
+            ws_name = str(active.get("name", "") or "")
+            on_ws = []
+            for client in matches:
+                workspace = client.get("workspace") or {}
+                if not isinstance(workspace, dict):
+                    continue
+                if workspace.get("id") == ws_id:
+                    on_ws.append(client)
+                elif ws_name and str(workspace.get("name", "")) == ws_name:
+                    on_ws.append(client)
+            pool = on_ws if on_ws else matches
+
+            def focus_key(client):
+                raw = client.get("focusHistoryID")
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return 10**9
+
+            pool.sort(key=focus_key)
+            return pool[0]
 
         def focus_client(self, client):
             address = str(client.get("address", ""))
             if not address:
                 return False
-            return spawn_command(["hyprctl", "dispatch", "focuswindow", f"address:{address}"])
+            # focuswindow switches to that window's workspace; do not route
+            # through spawn_command (dispatch exec hyprctl ...).
+            return hypr_dispatch("focuswindow", f"address:{address}")
 
 
         def activate(self, index, force_new=False):
